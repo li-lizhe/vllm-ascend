@@ -211,11 +211,14 @@ class MLPRowParallelOp(CustomRowParallelOp):
         return get_mlp_tp_group()
 
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        import os
+        print(f"[OTP_DEBUG] MLPRowParallelOp apply_impl: prefix={self.prefix}, input_shape={input_.shape}, tp_size={self.tp_size}, tp_rank={self.tp_rank}, pid={os.getpid()}", flush=True)
         input_parallel = self.get_input_parallel(input_)
 
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+        print(f"[OTP_DEBUG] MLPRowParallelOp reduce_scatter: output_parallel_shape={output_parallel.shape}, pid={os.getpid()}", flush=True)
         output = self.comm_group.reduce_scatter(output_parallel, 0)
 
         output_bias = self.bias if self.skip_bias_add else None
@@ -239,6 +242,8 @@ class OProjRowParallelOp(CustomRowParallelOp):
         self,
         input_: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        import os
+        print(f"[OTP_DEBUG] OProjRowParallelOp.apply_impl: prefix={self.prefix}, is_wo_b={self.is_wo_b}, enforce_eager={get_ascend_config().vllm_config.model_config.enforce_eager}, pid={os.getpid()}", flush=True)
         # wo_b in OTP mode: weight is row-sliced, input is full (unsplit).
         # Simple path: matmul with row shard → all_gather output.
         if self.is_wo_b:
