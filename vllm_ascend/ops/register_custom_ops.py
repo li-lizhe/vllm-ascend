@@ -72,24 +72,26 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
 
 
 def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
+    import os
     try:
         forward_context = get_forward_context()
     except AssertionError:
+        print(f"[OTP_DEBUG] _maybe_pad_and_reduce: no forward_context, pid={os.getpid()}", flush=True)
         return tensor_model_parallel_all_reduce(x)
 
     flash_comm_v1_enabled = getattr(forward_context, "flash_comm_v1_enabled", False) or (
         enable_sp_by_pass() and is_ep_comm
     )
+    print(f"[OTP_DEBUG] _maybe_pad_and_reduce: flash_comm_v1={flash_comm_v1_enabled}, dp_metadata={forward_context.dp_metadata is not None}, is_ep_comm={is_ep_comm}, x_shape={x.shape}, pid={os.getpid()}", flush=True)
 
     if not flash_comm_v1_enabled or (forward_context.is_draft_model and is_vl_model() and not is_ep_comm):
         return tensor_model_parallel_all_reduce(x)
 
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None or not is_ep_comm:
-        pad_size = _EXTRA_CTX.pad_size
-        if pad_size > 0:
-            x = F.pad(x, (0, 0, 0, pad_size))
-        return tensor_model_parallel_reduce_scatter(x, 0)
+        # OTP mode: reduce_scatter fails with unequal batch sizes across DP ranks.
+        # Use all_reduce instead.
+        return tensor_model_parallel_all_reduce(x)
     else:
         if enable_sp_by_pass():
             return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
