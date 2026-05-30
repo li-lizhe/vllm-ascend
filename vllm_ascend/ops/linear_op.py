@@ -211,14 +211,11 @@ class MLPRowParallelOp(CustomRowParallelOp):
         return get_mlp_tp_group()
 
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        import os
-        print(f"[OTP_DEBUG] MLPRowParallelOp apply_impl: prefix={self.prefix}, input_shape={input_.shape}, tp_size={self.tp_size}, pid={os.getpid()}", flush=True)
         input_parallel = self.get_input_parallel(input_)
 
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
-        print(f"[OTP_DEBUG] MLPRowParallelOp reduce_scatter: output_parallel_shape={output_parallel.shape}, pid={os.getpid()}", flush=True)
         output = self.comm_group.reduce_scatter(output_parallel, 0)
 
         output_bias = self.bias if self.skip_bias_add else None
@@ -242,8 +239,6 @@ class OProjRowParallelOp(CustomRowParallelOp):
         self,
         input_: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        import os
-        print(f"[OTP_DEBUG] apply_impl ENTRY: prefix={self.prefix}, is_wo_b={self.is_wo_b}, tp_size={self.tp_size}, input_shape={input_.shape}, pid={os.getpid()}", flush=True)
         # wo_b in OTP mode: weight is row-sliced, input is full (unsplit).
         # Simple path: matmul with row shard → all_gather output.
         if self.is_wo_b:
@@ -321,96 +316,18 @@ class OProjRowParallelOp(CustomRowParallelOp):
                 input_, num_partitions=self.tp_size)
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
-        # When tp_size=1 (OTP mode), each OTP rank has its own DP rank with
-        # potentially different batch sizes. The dp_metadata-based calculation
-        # produces inconsistent chunk sizes across OTP ranks, causing
-        # HcclReduceScatter to fail. Use local batch size directly instead.
-        local_batch_size = input_parallel.size(0)
-        import os
-        print(f"[OTP_DEBUG] eager_apply_impl prefix={self.prefix}, is_wo_b={self.is_wo_b}, tp_size={self.tp_size}, local_batch={local_batch_size}, pid={os.getpid()}", flush=True)
-
-        forward_context = get_forward_context()
-
-        if self.tp_size == 1:
-            # OTP mode: simple reduce-scatter with uniform chunks
-            import os
-            assert self.quant_method is not None
-            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-            output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
-            print(f"[OTP_DEBUG] OTP RS: prefix={self.prefix}, output_parallel_shape={output_parallel.shape}, pid={os.getpid()}", flush=True)
-            # Each OTP rank contributes a uniform chunk of size local_batch_size.
-            # Reduce-scatter sums across all otp_size ranks, output is same size.
-            output = self.comm_group.reduce_scatter(output_parallel, dim=0)
-            output = output.view(input_.shape[0], self.layer.output_size)
-            output_bias = self.bias if self.skip_bias_add else None
-            return output, output_bias
-
-        # tp_size > 1: standard TP path with DP coordination
-
-        forward_context = get_forward_context()
-        # Prepare tensors for all-to-all communication
-        local_batch_size = input_parallel.size(0)
-        chunk_size = self.input_size_per_partition
-
-        cu_tokens_across_dp_cpu = forward_context.dp_metadata.cu_tokens_across_dp_cpu
-        prefix_array = cu_tokens_across_dp_cpu.cpu().numpy()
-        global_batch_size = np.concatenate(
-            ([prefix_array[0]], np.diff(prefix_array)))
-        tp_group_id = self.dp_rank // self.tp_size
-        tp_group_batchsize = global_batch_size[tp_group_id *
-                                               self.tp_size:tp_group_id *
-                                               self.tp_size + self.tp_size]
-        total_batch_size = sum(tp_group_batchsize)
-
-        # Reshape for all-to-all communication
-        send_buf = (input_parallel.reshape(-1,
-                                           self.tp_size, chunk_size).transpose(
-                                               0, 1).contiguous().view(-1))
-        # Create receive buffer
-        recv_buf = torch.zeros(total_batch_size * chunk_size,
-                               dtype=input_parallel.dtype,
-                               device=input_parallel.device)
-
-        # Create split array
-        recv_splits = [size * chunk_size for size in tp_group_batchsize]
-        send_splits = [local_batch_size * chunk_size] * self.tp_size
-
-        # Perform all-to-all communication
-        dist.all_to_all_single(recv_buf,
-                               send_buf,
-                               recv_splits,
-                               send_splits,
-                               group=self.comm_group.device_group)
-
-        input_parallel = recv_buf.view(total_batch_size, chunk_size)
-
-        # Only fuse bias add for rank 0 to avoid duplicate bias addition in TP>1
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        # OTP mode (tp_size > 1 but global TP=1): each rank processes a different
+        # portion of the INPUT dimension and produces the FULL output dimension.
+        # Results need to be all_reduced (summed), not reduced-scattered.
+        # The dp_metadata-based all-to-all path fails with unequal batch sizes
+        # across DP ranks, so we use a simpler matmul + all_reduce path.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self.layer,
-                                                  input_parallel,
-                                                  bias=bias_)
-
-        # prepare all-reduce data
-        output = torch.empty(local_batch_size,
-                             output_parallel.size(1),
-                             dtype=output_parallel.dtype,
-                             device=output_parallel.device)
-
-        recv_chunks = []
-        start_idx = 0
-        for size in tp_group_batchsize:
-            chunk = output_parallel[start_idx:start_idx + size, :]
-            recv_chunks.append(chunk.contiguous())
-            start_idx += size
-
-        # Reduce-scatter the results across devices
-        dist.reduce_scatter(output,
-                            recv_chunks,
-                            op=dist.ReduceOp.SUM,
-                            group=self.comm_group.device_group)
-
-        # Handle bias return based on configuration
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+        # All-reduce to sum partial results from all OTP ranks
+        dist.all_reduce(output_parallel, op=dist.ReduceOp.SUM,
+                        group=self.comm_group.device_group)
+        output = output_parallel.view(input_.shape[0], self.layer.output_size)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
