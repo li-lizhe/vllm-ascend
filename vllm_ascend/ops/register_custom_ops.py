@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch_npu
 from vllm.distributed import (
@@ -102,7 +103,12 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
             padded_x[idx, :num_tokens_dp] = x[offset : offset + num_tokens_dp]
             offset += num_tokens_dp
 
-        return get_ep_group().reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
+        # OTP mode: different DP ranks may have different batch sizes during
+        # _dummy_run, causing reduce_scatter to fail with parameter mismatch.
+        # Use all_reduce instead which works with unequal per-rank data sizes.
+        local_result = padded_x[get_dp_group().rank_in_group, :num_tokens_across_dp_cpu[get_dp_group().rank_in_group]]
+        dist.all_reduce(local_result, op=dist.ReduceOp.SUM, group=get_ep_group().device_group)
+        return local_result.view(-1, *x.shape[1:])
 
 
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
