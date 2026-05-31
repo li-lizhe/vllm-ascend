@@ -84,3 +84,17 @@ import vllm.model_executor.model_loader.base_loader as base_loader
 base_loader.process_weights_after_loading = _ascend_process_weights_after_loading
 
 print(f"[OTP_PATCH] Monkey-patch applied, pid={os.getpid()}, loader_utils={loader_utils.process_weights_after_loading.__name__}, base_loader={base_loader.process_weights_after_loading.__name__}", flush=True)
+
+# Monkey-patch LogitsProcessor._gather_logits to skip all_gather in OTP mode
+import vllm.model_executor.layers.logits_processor as lp_module
+_orig_gather_logits = lp_module.LogitsProcessor._gather_logits
+
+def _otp_safe_gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+    from vllm_ascend.utils import oproj_tp_enable
+    if oproj_tp_enable():
+        # Skip all_gather in OTP mode - each rank already has full logits
+        return logits
+    return _orig_gather_logits(self, logits)
+
+lp_module.LogitsProcessor._gather_logits = _otp_safe_gather_logits
+print(f"[OTP_PATCH] LogitsProcessor._gather_logits patched for OTP mode, pid={os.getpid()}", flush=True)

@@ -45,6 +45,11 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
     except AssertionError:
         return x
 
+    # OTP mode: skip all_gather to avoid shape mismatch across DP ranks
+    from vllm_ascend.utils import oproj_tp_enable
+    if oproj_tp_enable():
+        return x
+
     flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled or (enable_sp_by_pass() and is_ep_comm)
     if flash_comm_v1_enabled and label:
         dp_metadata = forward_context.dp_metadata
