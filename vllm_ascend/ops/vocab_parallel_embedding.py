@@ -256,7 +256,10 @@ class AscendLogitsProcessor(LogitsProcessor):
         lm_head: AscendParallelLMHead,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        if lmhead_tp_enable():
+        # OTP mode: lm_head TP all_gather/all_to_all fails with unequal batch
+        # sizes across DP ranks. Fall back to normal path.
+        from vllm_ascend.utils import oproj_tp_enable
+        if lmhead_tp_enable() and not oproj_tp_enable():
             return self._get_logits_lmheadtp(hidden_states, lm_head, embedding_bias)
         else:
             return self._get_logits_normal(hidden_states, lm_head, embedding_bias)
