@@ -92,18 +92,18 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
 
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None or not is_ep_comm:
-        # OTP mode: all_reduce fails with unequal batch sizes across ranks.
-        # Pad to max batch size, all_reduce, then unpad.
+        # OTP mode: use OTP group for communication, not TP group (which has size 1).
+        from vllm_ascend.distributed.parallel_state import get_otp_group
         local_tokens = x.shape[0]
         max_tokens = torch.tensor([local_tokens], device=x.device)
         dist.all_reduce(max_tokens, op=dist.ReduceOp.MAX,
-                        group=get_tp_group().device_group)
+                        group=get_otp_group().device_group)
         max_tokens = max_tokens.item()
         if local_tokens < max_tokens:
             pad_tokens = max_tokens - local_tokens
             pad_shape = [pad_tokens] + list(x.shape[1:])
             x = torch.cat([x, torch.zeros(pad_shape, dtype=x.dtype, device=x.device)], dim=0)
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=get_tp_group().device_group)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=get_otp_group().device_group)
         return x[:local_tokens]
     else:
         if enable_sp_by_pass():
