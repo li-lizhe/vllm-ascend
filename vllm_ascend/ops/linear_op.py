@@ -211,14 +211,11 @@ class MLPRowParallelOp(CustomRowParallelOp):
         return get_mlp_tp_group()
 
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        import os
-        print(f"[OTP_DEBUG] MLPRowParallelOp apply_impl: prefix={self.prefix}, input_shape={input_.shape}, tp_size={self.tp_size}, tp_rank={self.tp_rank}, pid={os.getpid()}", flush=True)
         input_parallel = self.get_input_parallel(input_)
 
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
-        print(f"[OTP_DEBUG] MLPRowParallelOp reduce_scatter: output_parallel_shape={output_parallel.shape}, pid={os.getpid()}", flush=True)
         output = self.comm_group.reduce_scatter(output_parallel, 0)
 
         output_bias = self.bias if self.skip_bias_add else None
@@ -242,8 +239,6 @@ class OProjRowParallelOp(CustomRowParallelOp):
         self,
         input_: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        import os
-        print(f"[OTP_DEBUG] OProjRowParallelOp.apply_impl: prefix={self.prefix}, is_wo_b={self.is_wo_b}, enforce_eager={get_ascend_config().vllm_config.model_config.enforce_eager}, pid={os.getpid()}", flush=True)
         # wo_b in OTP mode: weight is row-sliced, input is full (unsplit).
         # Simple path: matmul with row shard → all_gather output.
         if self.is_wo_b:
@@ -322,17 +317,34 @@ class OProjRowParallelOp(CustomRowParallelOp):
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
         # OTP mode (tp_size > 1 but global TP=1): each rank processes a different
-        # portion of the INPUT dimension and produces the FULL output dimension.
-        # Results need to be all_reduced (summed), not reduced-scattered.
+        # portion of the INPUT dimension and produces a shard of the output.
+        # Results need to be all_reduced (summed) across OTP ranks.
         # The dp_metadata-based all-to-all path fails with unequal batch sizes
-        # across DP ranks, so we use a simpler matmul + all_reduce path.
+        # across DP ranks. Use all_gather with padding instead of all_reduce.
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+
+        # Pad to max batch size across OTP ranks for all_reduce compatibility
+        local_batch = output_parallel.shape[0]
+        max_batch = torch.tensor([local_batch], device=output_parallel.device)
+        dist.all_reduce(max_batch, op=dist.ReduceOp.MAX,
+                        group=self.comm_group.device_group)
+        max_batch = max_batch.item()
+
+        if local_batch < max_batch:
+            pad_shape = (max_batch - local_batch, output_parallel.shape[1])
+            output_parallel = torch.cat([
+                output_parallel,
+                torch.zeros(pad_shape, dtype=output_parallel.dtype,
+                            device=output_parallel.device)
+            ], dim=0)
+
         # All-reduce to sum partial results from all OTP ranks
         dist.all_reduce(output_parallel, op=dist.ReduceOp.SUM,
                         group=self.comm_group.device_group)
-        output = output_parallel.view(input_.shape[0], self.layer.output_size)
+
+        output = output_parallel[:local_batch].view(input_.shape[0], self.layer.output_size)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 

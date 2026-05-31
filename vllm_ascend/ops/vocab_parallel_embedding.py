@@ -172,8 +172,6 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             return self._forward_origin(input_)
 
     def _forward_embed_tp(self, input_):
-        import os
-        print(f"[OTP_DEBUG] _forward_embed_tp: input_shape={input_.shape}, tp_size={self.tp_size}, pid={os.getpid()}", flush=True)
         complete_input = self.comm_group.all_gather(input_, dim=0)
         masked_input, input_mask = self._get_masked_input_and_mask(
             complete_input,
