@@ -17,7 +17,6 @@
 
 
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.nn.parameter import Parameter
 from vllm.distributed import divide
@@ -163,6 +162,11 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
 
     def forward(self, input_):
         if self.forward_type == "embed_tp":
+            # OTP mode: embedding TP all_gather/reduce_scatter fails with unequal
+            # batch sizes across DP ranks. Fall back to non-TP path.
+            from vllm_ascend.utils import oproj_tp_enable
+            if oproj_tp_enable():
+                return self._forward_origin(input_)
             return self._forward_embed_tp(input_)
         else:
             return self._forward_origin(input_)
@@ -182,11 +186,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Get the embeddings.
         output_parallel = self.quant_method.embedding(self, masked_input.long())
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # OTP mode: reduce_scatter fails with unequal batch sizes across DP ranks.
-        # Use all_reduce instead.
-        dist.all_reduce(output_parallel, op=dist.ReduceOp.SUM,
-                        group=self.comm_group.device_group)
-        output = output_parallel.view(input_.shape[0], -1)
+        output = self.comm_group.reduce_scatter(output_parallel, dim=0)
+        output = output.view(input_.shape[0], -1)
         return output
 
     def _forward_origin(self, input_):
